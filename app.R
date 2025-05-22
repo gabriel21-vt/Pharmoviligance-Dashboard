@@ -1,6 +1,3 @@
-
-#source("logic.r")
-
 library(shiny)
 library(openxlsx)
 library(bslib)
@@ -15,26 +12,52 @@ library(glue)
 library(pvm)
 library(trend)
 library(reshape2)
+library(doParallel)
+library(foreach)
+library(zoo)
+library(tidyquant)
+library(tidyr)
+
+start_time <- proc.time()
 
 # Load and preprocess data
-#setwd("C:/Users/gabel/allergy-allies")
-df <- read.csv("./Data/cleaned_target_drugs.csv", header = TRUE)
+#setwd("C:/Users/gabel/allergy-allies/App-Dashboard")
+df <- read.csv("./Data/test_cleaning_file.csv", header = TRUE)
+
+#Read in the original unedited dataframe
+df_unedited <- read.csv("./Data/target_drugs_sample.csv")
+
+#Data dictionary
 data_dictionary <- "./Data/faers_analysis_dataset_dictionary.xlsx"
 df_faers_data_dictionary <- read.xlsx(data_dictionary, sheet = 1)
 df_faers_data_dictionary$Note <- NULL
+
 #Rename columns of df_faers_data_dictionary
 df_faers_data_dictionary <- df_faers_data_dictionary %>% `colnames<-`(c("Variable Name", "Description", "Type of Variable"))
+#Drop Type of Variable column
+df_faers_data_dictionary <- df_faers_data_dictionary %>% select(-`Type of Variable`)
 
-#Rename columns in df_target_drugs
 df_target_drugs <- read.xlsx(data_dictionary, sheet = 2) %>%
-  mutate(Brand.Name = str_replace(Brand.Name, "Singulaira", "Singulair")) %>%
+  mutate(
+    Brand.Name = str_replace(Brand.Name, "Singulaira", "Singulair"),
+    Brand.Name = str_to_lower(Brand.Name),
+    Generic.Name = str_to_lower(Generic.Name)
+  ) %>%
   filter(!is.na(Brand.Name)) %>%
-  mutate(Brand.Name = str_to_lower(Brand.Name))
-df_target_drugs <- df_target_drugs %>% `colnames<-`(c("Generic Name", "Brand Name", "Initial Approval Date", "Note"))
+  select(Generic.Name, Brand.Name)
 
-#Rename columns in df_psychiatric
+# Create a mapping vector (dictionary)
+drug_map <- setNames(df_target_drugs$Brand.Name, df_target_drugs$Generic.Name)
+
+# Ensure ps_drugname is lowercase and character type
+df <- df %>% mutate(ps_drugname = str_to_lower(as.character(ps_drugname)))
+
+# Map generic names to brand names while keeping unmatched values the same
+df <- df %>% mutate(ps_drugname = coalesce(recode(ps_drugname, !!!drug_map), ps_drugname))
+
 df_psychiatric <- read.xlsx(data_dictionary, sheet = 3)
-df_psychiatric <- df_psychiatric %>% `colnames<-`(c("Reaction Group", "Reaction"))
+#Select the only relevant column
+df_psychiatric <- df_psychiatric %>% select(Reaction)
 
 # Create Description Table
 description_table <- describe(df)
@@ -57,8 +80,9 @@ definition_table <- data.frame(
   )
 )
 
+#Use df_unedited
 df_copy <- df %>%
-  filter(ps_drugname %in% unique(df_target_drugs$`Brand Name`)) %>%
+  filter(ps_drugname %in% unique(df_target_drugs$Brand.Name)) %>%
   select(ps_drugname, age)
 
 # Step 2: Define age brackets
@@ -87,11 +111,12 @@ age_bracket_counts_long <- age_bracket_counts %>%
 
 #Remove rows where ps_drugname is null
 df = df %>% filter(!is.null(ps_drugname))
+
 #Filter df to only drugs in df_target_drugs
 df = df %>%
-  filter(ps_drugname %in% unique(df_target_drugs$`Brand Name`))
+ filter(ps_drugname %in% unique(df_target_drugs$Brand.Name))
 
-#Need to convert things to datetime
+# #Need to convert things to datetime
 df$fda_dt <- as.Date(df$fda_dt)
 df$event_dt <- as.Date(df$event_dt)
 df$init_fda_dt <- as.Date(df$init_fda_dt)
@@ -114,8 +139,15 @@ null_values_df <- arrange(null_values_df, desc(null_values))
 
 #Get the year of the fda case report
 years <- format(df$fda_dt, "%Y")
+
 #Put into a new column
 df$years = years
+
+#Format such that most recent year in data is removed based on case report(s) because the year is not finished and therefore could miss represent the data
+current_year <- as.numeric(format(Sys.Date(), "%Y")) - 1
+#remove dates that are greater or equal to the value of current year
+df <- df[as.numeric(df$years) < current_year, ]
+
 
 #creating a lag column
 df = df %>% mutate(lag = as.numeric(fda_dt - event_dt))
@@ -145,14 +177,16 @@ columns_to_keep <- null_values_df %>% filter(null_values < null_value_limit) %>%
   pull(column_name)
 #Use in "length_greater_15" for choices
 df_outc_cod_limit_null <- df_outc_cod %>% select(all_of(columns_to_keep))
-
+#Keep only certain columns that have more than 1 unique value but less than 200 unique values 
+#Doing manually for now, will figure out a better method later!
+df_outc_cod_limit_null <- df_outc_cod_limit_null %>% select(ps_drugname, age, sex, occr_country, reaction_pt)
 
 #################################################
 
 #Seperate df_outc_cod by outc_cod and use delimiter semicolon
 df_outc_cod <- df_outc_cod %>% separate_rows(outc_cod, sep = ";")
-#Remove the other column, visually not useful.
-df_outc_cod <- df_outc_cod %>% filter(outc_cod != "OT")
+
+
 
 #Recollapse df_outc_cod back into delimited data for accurate visualizations used by multiple selectInput(s)
 df_outc_cod <- df_outc_cod %>%
@@ -164,20 +198,23 @@ df_outc_cod <- df_outc_cod %>%
 #Use in ROR-PRR function
 df_reactions <- df_outc_cod %>% separate_rows(reaction_pt, sep = ";")
 
+#Do a stratified sampling of df_reactions to try and account for reporting bias and reduce computational time
+#Performing a proportional stratified sample so smaller groups are more represented.
+df_reactions <- df_reactions %>% group_by(ps_drugname) %>% slice_sample(prop = .40) %>% ungroup()
 
+print(head(df_reactions))
 
-#---------------ROR FUNCTION-----------------#
-##################################################
-ROR_PRR_func <- function(Drug, ADR, df, CI=0.95, column = c("Drug_ADR", "year")){
+########################ROR, PRR, BCPNN FUNCTION###############################
+ROR_PRR_BCPNN_func <- function(Drug, ADR, df, CI=0.95, column = c("Drug_ADR", "year"), type = c("ROR")){
   
   #check if column is of length 2
   if (length(column) != 2) {
-    return("Invalid column. Please provide a column with two elements.")
+    return ("Invalid column. Please provide a column with two elements.")
   }
   
-  #check if columns exist in df
+  # #check if columns exist in df
   if (!(column[1] %in% colnames(df)) || !(column[2] %in% colnames(df))) {
-    return("Invalid column. Please provide valid column names.")
+    return ("Invalid column. Please provide valid column names.")
   }
   
   independent_column <- sym(column[1])
@@ -191,7 +228,6 @@ ROR_PRR_func <- function(Drug, ADR, df, CI=0.95, column = c("Drug_ADR", "year"))
   b <- b %>% count(!!response_column, name = "Frequency") %>% arrange(desc(Frequency))
   b <- sum(b$Frequency) 
   
-  
   c <- df %>% filter(!!independent_column == Drug & !!response_column == ADR)
   c <- c %>% count(!!response_column, name = "Frequency") %>% arrange(desc(Frequency))
   c <- c %>% filter(!!response_column == ADR) %>% pull(Frequency)
@@ -200,327 +236,87 @@ ROR_PRR_func <- function(Drug, ADR, df, CI=0.95, column = c("Drug_ADR", "year"))
   d <- d %>% count(!!response_column, name = "Frequency") %>% arrange(desc(Frequency))
   d <- d %>% filter(!!response_column == ADR) %>% pull(Frequency)
   
-  ROR_value <- ROR(a, b, c, d)
-  PRR_value <- PRR(a, b, c, d, alpha = CI)
-  #BCPNN_value <- BCPNN(a, b, c, d, alpha = CI, version = 'alternative')
   
-  #return (glue("The Reporting Odds Ratio for {Drug}-{ADR} is: {ROR_value}"))
-  return (c(ROR = ROR_value, PRR = PRR_value))
+  results <- list()
+  
+  # Calculate ROR
+  if ("ROR" %in% type) {
+    value <- ROR(a,b,c,d)
+    results$ROR <- value
+  }
+  
+  # Calculate PRR
+  if ("PRR" %in% type) {
+    value1 <- PRR(a, b, c, d)
+    results$PRR <- value1
+  }
+  
+  # Calculate BCPNN
+  if ("BCPNN" %in% type) {
+    results$BCPNN <- BCPNN(a, b, c, d)
+  }
+  
+
+  
+  return (results)
   
 }
 
-Running_ROR_PRR <- function(df, data_column = c("Drug_ADR", "year")){
+#Running Function
+Running_ROR_PRR_BCPNN <- function(df, data_column = c("Drug_ADR", "years"), type = c("ROR"), updateProgress=NULL) {
+  
   rows <- unique(df %>% select(data_column[1]) %>% pull())
   rows <- as.character(rows)
   
-  #extract unique years and sort them
+  # Extract unique years and sort them
   columns <- unique(df %>% select(data_column[2]) %>% pull())
   columns <- sort(as.character(columns))
   
-  # Initialize an empty data frame with ADRs as rows and drugs as columns
-  ROR_table <- data.frame(matrix(NA, ncol= length(columns), nrow = length(rows)))
-  rownames(ROR_table) <- rows
-  colnames(ROR_table) <- columns
+  # Initialize a list to hold empty tables for each type
+  tables <- list()
+  for (t in type) {
+    tables[[t]] <- data.frame(matrix(NA, ncol = length(columns), nrow = length(rows)))
+    rownames(tables[[t]]) <- rows
+    colnames(tables[[t]]) <- columns
+  }
   
-  PRR_table <- ROR_table
-  
-  for (row in rows) {
-    for (column in columns) { 
+  foreach (column = columns) %do% {
+    foreach (row = rows) %do% {
       
-      # Attempt to calculate ROR and PRR with error handling
+      # Attempt to calculate ROR, PRR, or BCPNN with error handling
       ROR_PRR <- tryCatch({
-        result <- ROR_PRR_func(row, column, df, column = data_column)
+        result <- ROR_PRR_BCPNN_func(row, column, df, column = data_column, type = type, updateProgress)
         
         # Check if the result is numeric and has non-missing values
         if (is.null(result) || length(result) == 0 || any(is.na(result))) {
-          c(ROR = 0, PRR = 0)  # Return zeros for missing values
+          result <- list()  # Return an empty list for missing values
         } else {
           result
         }
       }, error = function(e) {
-        c(ROR = 0, PRR = 0)  # Handle errors by returning zeros
+        list()
       })
       
-      # Assign the ROR and PRR values to their respective tables
-      ROR_table[row, column] <- ifelse("ROR" %in% names(ROR_PRR), ROR_PRR["ROR"], 0)
-      PRR_table[row, column] <- ifelse("PRR" %in% names(ROR_PRR), ROR_PRR["PRR"], 0)
-    }
-  }
-  
-  ROR_table <- as.data.frame(ROR_table)
-  PRR_table <- as.data.frame(PRR_table)
-  
-  return(list(ROR_table = ROR_table, PRR_table = PRR_table))
-}
-
-
-
-
-################################################################################
-ROR_func <- function(Drug, ADR, df, CI=0.95, column = c("Drug_ADR", "year")){
-  
-  #check if column is of length 2
-  if (length(column) != 2) {
-    return("Invalid column. Please provide a column with two elements.")
-  }
-  
-  #check if columns exist in df
-  if (!(column[1] %in% colnames(df)) || !(column[2] %in% colnames(df))) {
-    return("Invalid column. Please provide valid column names.")
-  }
-  
-  independent_column <- sym(column[1])
-  response_column <- sym(column[2])
-  
-  a <- df %>% filter(!!independent_column == Drug & !!response_column != ADR)
-  a <- a %>% count(!!response_column, name = "Frequency") %>% arrange(desc(Frequency))
-  a <- sum(a$Frequency)
-  
-  b <- df %>% filter(!!independent_column != Drug & !!response_column != ADR)
-  b <- b %>% count(!!response_column, name = "Frequency") %>% arrange(desc(Frequency))
-  b <- sum(b$Frequency) 
-  
-  
-  c <- df %>% filter(!!independent_column == Drug & !!response_column == ADR)
-  c <- c %>% count(!!response_column, name = "Frequency") %>% arrange(desc(Frequency))
-  c <- c %>% filter(!!response_column == ADR) %>% pull(Frequency)
-  
-  d <- df %>% filter(!!independent_column != Drug & !!response_column == ADR)
-  d <- d %>% count(!!response_column, name = "Frequency") %>% arrange(desc(Frequency))
-  d <- d %>% filter(!!response_column == ADR) %>% pull(Frequency)
-  
-  ROR_value <- ROR(a, b, c, d)
-  
-  #return (glue("The Reporting Odds Ratio for {Drug}-{ADR} is: {ROR_value}"))
-  return (ROR_value)
-  
-}
-
-Running_ROR <- function(df, data_column = c("Drug_ADR", "year"), updateProgress = NULL) {
-  
-  # Extract unique rows (Drug_ADR) and columns (years)
-  rows <- unique(df %>% select(data_column[1]) %>% pull())
-  rows <- as.character(rows)
-  
-  columns <- unique(df %>% select(data_column[2]) %>% pull())
-  columns <- sort(as.character(columns))
-  
-  # Initialize an empty data frame with ADRs as rows and years as columns
-  ROR_table <- data.frame(matrix(NA, ncol = length(columns), nrow = length(rows)))
-  rownames(ROR_table) <- rows
-  colnames(ROR_table) <- columns
-  
-  # Loop through each Drug_ADR and year
-  for (row in rows) {
-    if (is.function(updateProgress)) {
-      text <- paste0("Adding row: ", row)
-      updateProgress(detail = text)
-    }
-    for (column in columns) {
-      # Attempt to calculate ROR with error handling
-      ROR_value <- tryCatch({
-        result <- ROR_func(row, column, df, column = data_column)
-        
-        # Ensure result is valid
-        if (is.null(result) || is.na(result)) {
-          0  # Return 0 for missing or invalid values
-        } else {
-          result
+      # Populate the appropriate tables based on the `type` results
+      for (t in type) {
+        tables[[t]][row, column] <- ifelse(!is.null(names(ROR_PRR)) && t %in% names(ROR_PRR), ROR_PRR[[t]], 0)
+        if (is.function(updateProgress)) {
+          text <- paste0("Adding column: ", column)
+          updateProgress(detail = text)
         }
-      }, error = function(e) {
-        0  # Handle errors by returning 0
-      })
-      
-      # Assign the ROR value to the table
-      ROR_table[row, column] <- ROR_value
+      }
     }
   }
   
-  # Convert to a data frame and return the results
-  ROR_table <- as.data.frame(ROR_table)
-  
-  return(list(ROR_table = ROR_table))
+  # Convert each table in the list to a data frame for output
+  tables <- lapply(tables, as.data.frame)
+  return(tables)
 }
 
 
 
-###############################################################################
-##########################PRR Function ########################################
-PRR_func <- function(Drug, ADR, df, CI=0.95, column = c("Drug_ADR", "year")){
-  
-  #check if column is of length 2
-  if (length(column) != 2) {
-    return("Invalid column. Please provide a column with two elements.")
-  }
-  
-  #check if columns exist in df
-  if (!(column[1] %in% colnames(df)) || !(column[2] %in% colnames(df))) {
-    return("Invalid column. Please provide valid column names.")
-  }
-  
-  independent_column <- sym(column[1])
-  response_column <- sym(column[2])
-  
-  a <- df %>% filter(!!independent_column == Drug & !!response_column != ADR)
-  a <- a %>% count(!!response_column, name = "Frequency") %>% arrange(desc(Frequency))
-  a <- sum(a$Frequency)
-  
-  b <- df %>% filter(!!independent_column != Drug & !!response_column != ADR)
-  b <- b %>% count(!!response_column, name = "Frequency") %>% arrange(desc(Frequency))
-  b <- sum(b$Frequency) 
-  
-  
-  c <- df %>% filter(!!independent_column == Drug & !!response_column == ADR)
-  c <- c %>% count(!!response_column, name = "Frequency") %>% arrange(desc(Frequency))
-  c <- c %>% filter(!!response_column == ADR) %>% pull(Frequency)
-  
-  d <- df %>% filter(!!independent_column != Drug & !!response_column == ADR)
-  d <- d %>% count(!!response_column, name = "Frequency") %>% arrange(desc(Frequency))
-  d <- d %>% filter(!!response_column == ADR) %>% pull(Frequency)
-  
-  PRR_value <- PRR(a, b, c, d, alpha = CI)
-  #BCPNN_value <- BCPNN(a, b, c, d, alpha = CI, version = 'alternative')
-  
-  #return (glue("The Reporting Odds Ratio for {Drug}-{ADR} is: {ROR_value}"))
-  return (PRR_value)
-  
-}
-
-Running_PRR <- function(df, data_column = c("Drug_ADR", "year"), updateProgress = NULL){
-  rows <- unique(df %>% select(data_column[1]) %>% pull())
-  rows <- as.character(rows)
-  
-  #extract unique years and sort them
-  columns <- unique(df %>% select(data_column[2]) %>% pull())
-  columns <- sort(as.character(columns))
-  
-  # Initialize an empty data frame with ADRs as rows and drugs as columns
-  PRR_table <- data.frame(matrix(NA, ncol= length(columns), nrow = length(rows)))
-  rownames(PRR_table) <- rows
-  colnames(PRR_table) <- columns
-  
-  
-  for (row in rows) {
-    if (is.function(updateProgress)) {
-      text <- paste0("Adding row: ", row)
-      updateProgress(detail = text)
-    }
-    for (column in columns) {
-      # Attempt to calculate ROR with error handling
-      PRR_value <- tryCatch({
-        result <- PRR_func(row, column, df, column = data_column)
-        
-        # Ensure result is valid
-        if (is.null(result) || is.na(result)) {
-          0  # Return 0 for missing or invalid values
-        } else {
-          result
-        }
-      }, error = function(e) {
-        0  # Handle errors by returning 0
-      })
-      
-      # Assign the ROR value to the table
-      PRR_table[row, column] <- PRR_value
-    }
-  }
-  
-  PRR_table <- as.data.frame(PRR_table)
-  
-  return(list(PRR_table = PRR_table))
-}
-
-###############################################################################
-##########################BCPNN Function ########################################
-BCPNN_func <- function(Drug, ADR, df, CI=0.95, column = c("Drug_ADR", "year")){
-  
-  #check if column is of length 2
-  if (length(column) != 2) {
-    return("Invalid column. Please provide a column with two elements.")
-  }
-  
-  #check if columns exist in df
-  if (!(column[1] %in% colnames(df)) || !(column[2] %in% colnames(df))) {
-    return("Invalid column. Please provide valid column names.")
-  }
-  
-  independent_column <- sym(column[1])
-  response_column <- sym(column[2])
-  
-  a <- df %>% filter(!!independent_column == Drug & !!response_column != ADR)
-  a <- a %>% count(!!response_column, name = "Frequency") %>% arrange(desc(Frequency))
-  a <- sum(a$Frequency)
-  
-  b <- df %>% filter(!!independent_column != Drug & !!response_column != ADR)
-  b <- b %>% count(!!response_column, name = "Frequency") %>% arrange(desc(Frequency))
-  b <- sum(b$Frequency) 
-  
-  
-  c <- df %>% filter(!!independent_column == Drug & !!response_column == ADR)
-  c <- c %>% count(!!response_column, name = "Frequency") %>% arrange(desc(Frequency))
-  c <- c %>% filter(!!response_column == ADR) %>% pull(Frequency)
-  
-  d <- df %>% filter(!!independent_column != Drug & !!response_column == ADR)
-  d <- d %>% count(!!response_column, name = "Frequency") %>% arrange(desc(Frequency))
-  d <- d %>% filter(!!response_column == ADR) %>% pull(Frequency)
-  
-  BCPNN_value <- BCPNN(a, b, c, d, alpha = CI)
-  #print(BCPNN_value)
-  
-  #return (glue("The Reporting Odds Ratio for {Drug}-{ADR} is: {ROR_value}"))
-  return(BCPNN_value)
-  
-}
-
-Running_BCPNN <- function(df, data_column = c("Drug_ADR", "year"), updateProgress = NULL) {
-  # Extract unique rows (Drug_ADR) and columns (years)
-  rows <- unique(df %>% select(data_column[1]) %>% pull())
-  rows <- as.character(rows)
-  
-  columns <- unique(df %>% select(data_column[2]) %>% pull())
-  columns <- sort(as.character(columns))
-  
-  # Initialize an empty data frame with ADRs as rows and years as columns
-  BCPNN_table <- data.frame(matrix(NA, ncol = length(columns), nrow = length(rows)))
-  rownames(BCPNN_table) <- rows
-  colnames(BCPNN_table) <- columns
-  
-  # Loop through each Drug_ADR and year
-  for (row in rows) {
-    if (is.function(updateProgress)) {
-      text <- paste0("Adding row: ", row)
-      updateProgress(detail = text)
-    }
-    for (column in columns) {
-      # Attempt to calculate BCPNN with error handling
-      BCPNN <- tryCatch({
-        result <- BCPNN_func(row, column, df, column = data_column)
-        
-        # Check if the result is numeric and has non-missing values
-        if (is.null(result) || is.na(result)) {
-          0  # Return 0 for missing or invalid values
-        } else {
-          result
-        }
-      }, error = function(e) {
-        0  # Handle errors by returning 0
-      })
-      
-      # Assign the BCPNN value to the table
-      BCPNN_table[row, column] <- BCPNN
-    }
-  }
-  
-  # Convert to a data frame and return the results
-  BCPNN_table <- as.data.frame(BCPNN_table)
-  
-  return(list(BCPNN_table = BCPNN_table))
-}
-
-
-#---------------------------Pie chart function---------------------------------#
-################################################################################
-pie_func <- function(table, condition, type=c("ROR", "PRR", "BCPNN")) {
+############################Bar chart function##################################
+bar_func <- function(table, condition, type=c("ROR", "PRR", "BCPNN")) {
   
   #if the type is not ROR or PRR, return an error
   if (!(type %in% c("ROR", "PRR", "BCPNN"))) {
@@ -538,7 +334,6 @@ pie_func <- function(table, condition, type=c("ROR", "PRR", "BCPNN")) {
       easyClose = TRUE
     ))
     return()
-    #return(glue("No existing rows for {condition}, please choose another condition."))
   }
   
   #Check if the selected row is all NA
@@ -549,7 +344,6 @@ pie_func <- function(table, condition, type=c("ROR", "PRR", "BCPNN")) {
       easyClose = TRUE
     ))
     return()
-    #return(glue("No {type} values for {condition}"))
   }
   if (nrow(selected_row) == 0) {
     showModal(modalDialog(
@@ -558,10 +352,9 @@ pie_func <- function(table, condition, type=c("ROR", "PRR", "BCPNN")) {
       easyClose = TRUE
     ))
     return()
-    #return(glue("No {type} values for {condition}"))
   }
   
-  #If a value is 0, replace with NA so it won't show in the pie chart
+  #If a value is 0, replace with NA so it won't show in the chart
   # Remove values that are exactly 0
   selected_row <- selected_row[, selected_row != 0, drop = FALSE]
   
@@ -573,7 +366,6 @@ pie_func <- function(table, condition, type=c("ROR", "PRR", "BCPNN")) {
       easyClose = TRUE
     ))
     return()
-    #stop(glue("No {type} values for {condition} to plot"))
   }
   
   # Convert to a data frame for ggplot
@@ -586,25 +378,25 @@ pie_func <- function(table, condition, type=c("ROR", "PRR", "BCPNN")) {
   plot_data$Value <- round(plot_data$Value, 2)
   
   # Create the barplot
-  p <- ggplot(plot_data, aes(x = "", y = Value, fill=Drug)) +
-    geom_col(color = "black") +
-    geom_label(aes(label = Value),
-               position = position_stack(vjust = 0.5),
-               show.legend = FALSE, color = "black") + 
-    labs(title = glue("{type} value for {condition}")) +
-    coord_polar(theta = "y") +   
-    scale_fill_brewer() +
-    theme_void() + theme(
+  p <- ggplot(plot_data, aes(x = Drug, y = Value, fill = Drug)) +
+    geom_bar(stat = "identity", color = "black") +  # Use 'identity' to plot actual values
+    geom_text(aes(label = Value), vjust = -0.5, size = 5) +  # Add labels on top of bars
+    labs(title = "ROR Values for Allergic Rhinitis Drugs given Psychartic Condition", x = "Drug", y = "ROR Value") +
+    theme_minimal()+
+    theme(
       plot.title = element_text(hjust = 0.5, size = 20),
-      legend.title = element_text(size = 15),
-      legend.text = element_text(size = 12)
+      axis.text.x = element_text(size = 12),
+      axis.text.y = element_text(size = 12),
+      axis.title.x = element_text(size = 15),
+      axis.title.y = element_text(size = 15),
+      legend.position = "none"  # Remove the legend
+      
     )
   
   return(p)
 }
 
 
-################################################################################
 ############################Line-plot function##################################
 
 lineplot_func <- function(table, conditions, type=c("ROR", "PRR", "BCPNN")) {
@@ -614,55 +406,43 @@ lineplot_func <- function(table, conditions, type=c("ROR", "PRR", "BCPNN")) {
     return("Invalid type. Please select 'ROR' or 'PRR'.")
   }
   
-  #check if type is ROR and table is PRR_table, return an error
-  if (type == "ROR" && identical(table, t(PRR_pair_years))) {
-    return("Invalid table. Please select the ROR table.")
-  }
-  if (type == "PRR" && identical(table, t(ROR_pair_years))) {
-    return("Invalid table. Please select the PRR table.")
-  }
-  if (type == "BCPNN" && identical(table, t(BCPNN_pair_years))) {
-    return("Invalid table. Please select the BCPNN table.")
-  }
-  
   # Select the row matching the condition
-  selected_rows <- table[conditions, , drop = FALSE]
-  
+  selected_rows <- table %>% filter(Drug_ADR %in% conditions) %>% group_by(Drug_ADR) %>% arrange(years)
+
   #Check if the selected row is all NA
   if (all(is.na(selected_rows))) {
     showModal(modalDialog(
       title = "Selection Error",
-      glue("No {type} values for {condition}"),
+      glue("No {type} values for {conditions}"),
       easyClose = TRUE
     ))
     return()
-    #return(glue("No {type} values for {condition}"))
   }
   if (nrow(selected_rows) == 0) {
     showModal(modalDialog(
       title = "Selection Error",
-      glue("No {type} values for {condition}"),
+      glue("No {type} values for {conditions}"),
       easyClose = TRUE
     ))
     return()
-    #return(glue("No {type} values for {condition}"))
   }
   
-  plot_data <- as.data.frame(t(selected_rows))
-  #print(plot_data)
-  plot_data$year <- rownames(plot_data)
-  data_long <- melt(plot_data, id="year")
-  
+
   # Create the lineplot
-  p <- ggplot(data_long, aes(x = year, y = value, color=variable, group=variable)) +
-    geom_line() +
-    geom_point(color = "black") +
-    labs(title = glue("{type} value for Drug-ADR(s) over time"),
-         x = "Year",
-         y = "Value") +
+  p <- ggplot(selected_rows, aes(x = years, y = .data[[type]], color = Drug_ADR, group = Drug_ADR)) +
+    geom_point(size = 3) +  # Plot ROR values as points
+    geom_line() +  # Connect points with a line
+    geom_errorbar(aes(ymin = lower_CI, ymax = upper_CI), width = 0.2) +  # Confidence intervals
+    scale_y_log10() +  # Log scale for better visualization
+    labs(
+      title = glue("{type} Over Time with log scale 95% Confidence Interval"),
+      x = "Year",
+      y = glue("{type} values"),
+      color = "Drug-ADR"
+    ) +
     theme_minimal() + theme(
       plot.title = element_text(hjust = 0.5, size = 20),  # Centers the plot title
-      axis.text.x = element_text(angle = 45, size = 15),
+      axis.text.x = element_text(angle = 0, size = 15),
       axis.text.y = element_text(angle = 0, size = 15),
       axis.title.x = element_text(size = 18),
       axis.title.y = element_text(size = 18),
@@ -673,65 +453,42 @@ lineplot_func <- function(table, conditions, type=c("ROR", "PRR", "BCPNN")) {
   return(p)
 }
 
-################################################################################
+
 #############################Mann Kendall Test##################################
 
 
 # find the max value of each drug-adr pair in ROR_pair_years
-mann_kendall_test <- function(df) {
-  trend_results <- data.frame(Drug_ADR = rownames(df), P_Value = NA, Score = NA)
+mann_kendall_test <- function(df, type=c("ROR", "PRR", "BCPNN")) {
+  trend_results <- data.frame(Drug_ADR = character(), P_Value = numeric(), Score = numeric(), stringsAsFactors = FALSE)
   
-  for (drug_adr in rownames(df)) {
-    ror_values <- as.numeric(df[drug_adr, ])
+  # Loop over unique Drug-ADR combinations
+  for (drug_adr in unique(df$Drug_ADR)) {
+    # Extract ROR values for the given Drug-ADR over time
+    values <- df %>%
+      filter(Drug_ADR == drug_adr) %>%
+      arrange(years) %>%
+      pull(type)  # Extract ROR values as a numeric vector
     
-    # Perform Mann-Kendall test
-    test <- mk.test(ror_values, alternative = "two.sided")
-    trend_results[trend_results$Drug_ADR == drug_adr, "Score"] <- test$estimates[1]
-    trend_results[trend_results$Drug_ADR == drug_adr, "P_Value"] <- test$p.value
+    # Ensure at least 2 unique time points exist for the test
+    if (length(values) > 2 && length(unique(values)) > 1) {
+      test <- mk.test(values, alternative = "two.sided")  # Mann-Kendall Test
+      trend_results <- rbind(trend_results, data.frame(Drug_ADR = drug_adr, Score = test$estimates[1], P_Value = test$p.value))
+    }
   }
   
   return(trend_results)
 }
 
-#---------------------Data Preprocessing for trend test -----------------------#
+#Checking timings of computations
+end_time <- proc.time()
+elasped_time = end_time - start_time
+print(elasped_time)
 
-columns <- c("ps_drugname", "reaction_pt")
-df_reaction_pair_year <- df_reactions %>%
-  group_by(across(all_of(columns)), years) %>%  # Group by the columns in the list and 'year'
-  summarise(Count = n(), .groups = 'drop')
-
-#in df_reaction_no_singulair, combine ps_drugname and reaction_pt to create a new column
-df_reaction_pair_year$Drug_ADR <- paste(df_reaction_pair_year$ps_drugname,df_reaction_pair_year$reaction_pt, sep = "-")
-
-tables <- Running_ROR_PRR(df_reaction_pair_year, c("Drug_ADR", "years"))
-
-#ROR drug adr trend analysis
-ROR_pair_years <- tables["ROR_table"]$ROR_table
-trend_test_ROR <- mann_kendall_test(ROR_pair_years)
-#filter trend test to only include values less than 0.05 and score greater than 0, indicating a positive trend
-trend_test_ROR <- trend_test_ROR %>% filter(P_Value < 0.05 & Score > 0)
-trend_test_ROR <- trend_test_ROR %>% arrange(P_Value)
-drug_adr_trend_ROR <- trend_test_ROR$Drug_ADR
-
-#PRR drug-adr trend analysis
-PRR_pair_years <- tables["PRR_table"]$PRR_table
-trend_test_PRR <- mann_kendall_test(PRR_pair_years)
-trend_test_PRR <- trend_test_ROR %>% filter(P_Value < 0.05 & Score > 0)
-trend_test_PRR <- trend_test_ROR %>% arrange(P_Value)
-drug_adr_trend_PRR <- trend_test_PRR$Drug_ADR
-
-BCPNN_table <- Running_BCPNN(df_reaction_pair_year, c("Drug_ADR", "years"))
-BCPNN_pair_years <- BCPNN_table$BCPNN_table
-trend_test_BCPNN <- mann_kendall_test(BCPNN_pair_years)
-drug_adr_trend_BCPNN <- trend_test_BCPNN$Drug_ADR
-#--------------------UI----------------------------#
-####################################################
-
-ui <- page_navbar(
+################################UI##############################################
+ui <- fluidPage(
   title = "Pharmocoviligance Application",
   theme = bs_theme(bootswatch = "minty"),
-  #useShinyjs(),
-  
+
   tags$head(
     tags$style(HTML("
     .title-page {
@@ -739,325 +496,386 @@ ui <- page_navbar(
       background-size: cover; /* Ensures the image covers the entire container */
       background-attachment: fixed; /* Keeps the background fixed */
       background-position: center; /* Centers the image */
-      padding: 0px; /* Adds space around the content */
-      /*color: white; Ensures text is visible on the background */
-      text-align: center; /* Aligns the text to the right */
-      min-height: 3000px; /* Ensures it takes up full viewport height */
-    }
-    .content-a {
-      margin-top: 1000px;
-    }
-    .content-b {
-      margin-top: 1700px;
-    }
-    .content-c {
-      margin-top: 2400px;
-    }
-    #text-box-a {
-      box-sizing: content-box;  
-      width: 300px;
-      height: 250px;
-      padding: 0px;  
-      background-color: rgba(255, 0, 0, 0);
-      color: white;
-      font-size: 14px;
-      float: left;
-      text-align: left;
-      margin-left: 20px;
-      
-    }
-    
-    #text-box-b {
-      box-sizing: content-box;  
-      width: 300px;
-      height: 250px;
-      padding: 0px;  
-      background-color: rgba(255, 0, 0, 0);
-      color: white;
-      font-size: 14px;
-      float: right; /* Move the entire box to the right */
-      text-align: right; /* Align text inside the box to the right */
-      margin-right: 20px; /* Optional spacing from the edge */
-    }
-    
-    #text-box-c {
-      box-sizing: content-box;  
-      width: 300px;
-      height: 250px;
-      padding: 0px;  
-      background-color: rgba(255, 0, 0, 0);
-      color: white;
-      font-size: 14px;
-      float: left;
-      text-align: left;
-      margin-left: 20px;
+      padding: 0; /* No extra padding around the content */
+      text-align: center; /* Aligns the text */
+      min-height: 100vh; /* Takes up the full viewport height */
+      display: grid; /* Use grid for layout */
+      grid-template-rows: 1fr 2fr 3fr; /* Define grid row heights */
+      grid-template-columns: 1fr 1fr; /* Define two columns */
+      gap: 5vh; /* Space between rows */
     }
 
+    #text-box-a {
+      grid-row: 1; /* Place in the first row */
+      grid-column: 1; /* Place in the first column */
+      box-sizing: content-box;  
+      width: 60%; /* Relative width */
+      padding: 1em;  
+      background-color: rgba(255, 0, 0, 0); /* Semi-transparent background */
+      color: white;
+      font-size: 1rem; /* Responsive font size */
+      text-align: left; /* Align text inside the box to the left */
+      margin: 0 auto; /* Center horizontally */
+    }
+
+    #text-box-b {
+      grid-row: 2; /* Place in the second row */
+      grid-column: 2; /* Place in the second column */
+      box-sizing: content-box;  
+      width: 50%; /* Relative width */
+      padding: 1em;  
+      background-color: rgba(255, 0, 0, 0); /* Semi-transparent background */
+      color: white;
+      font-size: 1rem; /* Responsive font size */
+      text-align: right; /* Align text inside the box to the right */
+      margin: 0 auto; /* Center horizontally */
+    }
+
+    #text-box-c {
+      grid-row: 3; /* Place in the third row */
+      grid-column: 1; /* Place in the first column */
+      box-sizing: content-box;  
+      width: 50%; /* Relative width */
+      padding: 1em;  
+      background-color: rgba(255, 0, 0, 0); /* Semi-transparent background */
+      color: white;
+      font-size: 1rem; /* Responsive font size */
+      text-align: left; /* Align text inside the box to the left */
+      margin: 0 auto; /* Center horizontally */
+    }
+
+    /* Media query for smaller screens */
+    @media (max-width: 768px) {
+      .title-page {
+        grid-template-rows: auto; /* Adjust rows for stacking */
+        grid-template-columns: 1fr; /* Single column layout */
+      }
+
+      #text-box-a, #text-box-b, #text-box-c {
+        grid-column: 1; /* All boxes in the same column */
+        width: 90%; /* Adjust width for smaller screens */
+        text-align: center; /* Center text inside boxes */
+        margin: 1em auto; /* Center-align boxes */
+      }
+    }
   "))
   ),
   
-  # Title page
-  nav_panel(
-    title = "Front Page", icon = icon("house"),
-    div(class = "title-page",
-        h1("Welcome to this experimental pharmacovigilance website", style = "color: white;"),
-        h2("This app is designed to help you analyze the FAERS dataset.", style = "color: white;"),
-        div(class = "content-a", id="text-box-a",
-            h3("Medications have always been about helping people get healthier and increase longevity, but what happens when this doesn't occur?", style = "color: white;"),
-        ),
-        div(class = "content-b", id = "text-box-b",
-            h3("You may feel sick, dizzy or have a change in mood, whether it be physical or mental, this can be caused by medications unintentional effects", style = "color: white;")
-        ),
-        div(class = "content-c", id = "text-box-c",
-            h3("These effects are very difficult to find and to find them we have to find patterns in our data to use this, now looking at the FDA Adverse Event Reporting System (FAERS),
-               try and achieve this.", style = "color: white;")
-        )
-    )
-  ),
-  
-  # Tab 1: Tables
-  nav_panel(
-    title = "Tables", icon = icon("table"),
-    sidebarLayout(
-      sidebarPanel(
-        selectInput("table_choice", "Choose a table:", 
-                    choices = c("Full Dataframe", "Target Drugs", "Psychiatric Conditions", "Description Table")),
-        conditionalPanel(
-          condition = "input.table_choice == 'Description Table'",
-          h4("Description Table Definitions"),
-          dataTableOutput("definition_table")
-        ),
-        conditionalPanel(
-          condition = "input.table_choice == 'Full Dataframe'",
-          h4("Full Dataframe Variable Definitions"),
-          dataTableOutput("df_faers_data_dictionary")
-        )
-      ), 
-      fluid = TRUE,
-      mainPanel(
-        dataTableOutput("selected_table")
-      )
-    )
-  ),
-  
-  # Tab 2: Plots
-  nav_panel(
-    title = "Exploratory Data Analysis", icon = icon("magnifying-glass"),
-    layout_sidebar(fluid = TRUE, position = "left", tags$style(HTML("
-        .control-label { white-space: normal; }  /* Ensure labels wrap properly */
-        .sidebar { padding: 10px; margin: 0; }  /* Adjust sidebar padding and margin */
-      ")),
-                   sidebar = sidebarPanel(width = 12,
-                                          sliderInput(
-                                            "slider_bins",
-                                            label = "Number of bins:",
-                                            min = 10,
-                                            max = 50,
-                                            value = 25
-                                          ),
-                                          sliderInput(
-                                            "slider_age_bracket",
-                                            label = "Select Age Bracket:",
-                                            min = 0,
-                                            max = 110,
-                                            step = 1,
-                                            value = c(0, 110)
-                                          ),
-                                          sliderInput(
-                                            "year",
-                                            label = "Select Interval:",
-                                            min = min(as.numeric(df$years)),
-                                            max = max(as.numeric(df$years)),
-                                            step = 1,
-                                            value = c(min(as.numeric(df$years)), max(as.numeric(df$years))),
-                                            sep = ""
-                                          ),
-                                          sliderInput(
-                                            "lag_bins",
-                                            label = "Select Number of bins for lag histogram:",
-                                            min = 1,
-                                            max = 100,
-                                            step = 1,
-                                            value = 50
-                                          ),
-                                          selectInput(
-                                            "selected_drug",
-                                            label = "Select a Drug:",
-                                            choices = unique(df$ps_drugname),
-                                            selected = unique(df$ps_drugname)[1]
-                                          ),
-                                          selectInput("dataframe_columns", 
-                                                      label = "Select 2 columns to analyze:", 
-                                                      choices = colnames(df_outc_cod_limit_null), 
-                                                      multiple = TRUE
-                                          ),
-                                          conditionalPanel(
-                                            condition = "input.has_choices == TRUE", 
-                                            selectInput("length_greater_15",
-                                                        label = "Select as many options as you would like to compare (wouldn't recommend too many!)", 
-                                                        choices = "", 
-                                                        multiple = TRUE
-                                            )
-                                          ),
-                                          selectInput(
-                                            "unique_values", 
-                                            label = "Select 1 unique variable corresponding to your 1st input in the menu above",
-                                            choices = "",
-                                            multiple = TRUE
-                                          )
-                   ),
-                   mainPanel(
-                     div(plotOutput("plot_histogram", width = "1600px", height = "400px"), style="margin-bottom:100px;"),
-                     div(plotOutput("plot_drug_age_bracket", width = "1600px", height = "400px"), style="margin-bottom:100px;"),
-                     div(plotOutput("plot_total_cases", width = "1600px", height = "400px"), style="margin-bottom:100px;"),
-                     div(plotOutput("plot_lag_drug", width = "1600px", height = "400px"), style="margin-bottom:100px;"),
-                     div(plotOutput("plot_patient_outcome", width = "1600px", height = "400px"), style="margin-bottom:100px;")
-                   )
-    )
-  ),
-  
-  
-  navbarMenu(
-    title = "Statistical Tests and Analyses", icon = icon("chart-column"),
+  navset_card_tab(
+    height = "120%",
+    full_screen = FALSE,
+    wrapper = NULL,
     
-    # ROR Analysis
+    # Title page
     nav_panel(
-      title = "ROR Analysis", icon = icon("pills"),     
-      fluidPage(
-        div(style = "text-align:center;", 
-          h2("Reporting Odds Ratio (ROR)"),
-          p("The Reporting Odds Ratio (ROR) is calculated as:"),
-          tags$div(style = "text-align: center;",
-                   withMathJax("$$ROR = \\frac{a / b}{c / d} = \\frac{a \\cdot d}{b \\cdot c}$$")
+      title = "Front Page", icon = icon("house"),
+      div(class = "title-page",
+          h1("Welcome to this experimental pharmacovigilance website", style = "text-align:center, color: white;"),
+          div(class = "content-a", id="text-box-a",
+              h3("Medications have always been about helping people get healthier and increase longevity, but what happens when this doesn't occur?", style = "color: grey;"),
           ),
-          p("Where:"),
-          p("a: Number of cases where the drug is reported with the specific ADR."),
-          p("b: Number of cases where the drug is reported without the specific ADR."),
-          p("c: Number of cases where other drugs are reported with the specific ADR."),
-          p("d: Number of cases where other drugs are reported without the specific ADR."),
-          h3("Interpretation"),
-          p("ROR > 1: Suggests a positive association between the drug and the ADR."),
-          p("ROR = 1: No association."),
-          p("ROR < 1: Suggests a negative association.")
-          
-        )
-      ),
-      
-      layout_sidebar(fluid = TRUE, position = "left", tags$style(HTML("
-        .control-label { white-space: normal; }  /* Ensure labels wrap properly */
-        .sidebar { padding: 10px; margin: 0; }  /* Adjust sidebar padding and margin */
-      ")),
-        sidebar = sidebarPanel(width = 12,
-          checkboxGroupInput(inputId = "Gender_ROR",
-                             label = "Select Gender(s):",
-                             choices = c("Male" = "M", "Female" = "F", "Unknown" = "UNK"),
-                             selected = "M"),
-          
-          checkboxGroupInput(inputId = "Patient_Outcome_ROR",
-                             label = "Select Patient Outcome(s):",
-                             choices = c("Required Intervention" = "RI", 
-                                         "Congenital Anomaly" = "CA", 
-                                         "Disability" = "DS", 
-                                         "Hospitalization" = "HO", 
-                                         "Life Threatening" = "LT", 
-                                         "Death" = "DE"),
-                             selected = c("DE", "LT", "DS", "CA")),
-          
-          selectInput("psych_dropdown_ROR",
-                      label = "Select a psychiatric condition to analyze:",
-                      choices = sort(unique(df_reactions$reaction_pt)),
-                      multiple = FALSE,
-                      selected = "fear"),
-          
-          selectInput("Drug_ADR_ROR",
-                      label = "Pick a Drug-ADR to analyze:",
-                      choices = sort(unique(drug_adr_trend_ROR)),
-                      multiple = TRUE,
-                      selected = "")
-        ),
+          div(class = "content-b", id = "text-box-b",
+              h3("You may feel sick, dizzy or have a change in mood, whether it be physical or mental, this can be caused by medications unintentional effects", style = "color: grey;")
+          ),
+          div(class = "content-c", id = "text-box-c",
+              h3("These effects are very difficult to find and to find them we have to find patterns in our data to use this, now looking at the FDA Adverse Event Reporting System (FAERS),
+                 we can try and achieve this.", style = "color: grey;")
+          )
+      )
+    ),
+  
+    # Tab 1: Tables
+    nav_panel(
+      title = "Tables", icon = icon("table"),
+      sidebarLayout(
+        sidebarPanel(
+          selectInput("table_choice", "Choose a table:", 
+                      choices = c("Full Dataframe", "Target Drugs", "Psychiatric Conditions", "Description Table")),
+          conditionalPanel(
+            condition = "input.table_choice == 'Description Table'",
+            h4("Description Table Definitions"),
+            dataTableOutput("definition_table")
+          ),
+          conditionalPanel(
+            condition = "input.table_choice == 'Full Dataframe'",
+            h4("Full Dataframe Variable Definitions"),
+            dataTableOutput("df_faers_data_dictionary")
+          )
+        ), 
+        fluid = TRUE,
         mainPanel(
-          div(plotOutput("ROR_plot", width = "1600px", height = "400px"), style = "margin-bottom:100px;"),
-          div(uiOutput("caveatPieTextROR"), style = "margin-bottom:100px; text-align:center;"),
-          div(DT::dataTableOutput("ROR_table"), style = "width: 100%; margin-bottom:100px; text-align:center;"),
-          div(plotOutput("ROR_lineplot", width = "1600px", height = "400px"), style = "margin-bottom:100px;"),
-          div(uiOutput("caveatTextROR"), style = "margin-bottom:100px; text-align:center;")
+          dataTableOutput("selected_table")
         )
       )
     ),
-    
-    # PRR Analysis
+  
+    # Tab 2: Plots
     nav_panel(
-      title = "PRR Analysis",
-      icon = icon("chart-area"),       
-      fluidPage(
-        div(style="text-align:center;",
-          h2("Proportional Reporting Ratio (PRR)"),
-          p("The Proportional Reporting Ratio (PRR) is calculated as:"),
-          tags$div(style = "text-align: center;",
-                   withMathJax("$$PRR = \\frac{\\text{Proportion of ADR for the drug}}{\\text{Proportion of ADR for all other drugs}}$$"),
-                   withMathJax("$$PRR = \\frac{a / (a + b)}{c / (c + d)}$$")
+      title = "Exploratory Data Analysis", icon = icon("magnifying-glass"),
+      
+      card(
+        height = "100%",
+        full_screen = TRUE,
+        layout_sidebar(
+          sidebar = sidebarPanel(width = 12,
+                                 sliderInput(
+                                   "slider_bins",
+                                   label = "Number of bins:",
+                                   min = 10,
+                                   max = 50,
+                                   value = 25
+                                 )
           ),
-          p("Where:"),
-          p("a: Number of cases where the drug is reported with the specific ADR."),
-          p("b: Number of cases where the drug is reported without the specific ADR."),
-          p("c: Number of cases where other drugs are reported with the specific ADR."),
-          p("d: Number of cases where other drugs are reported without the specific ADR."),
-          h3("Interpretation"),
-          p("PRR > 1: Indicates a higher frequency of the ADR for the drug."),
-          p("PRR = 1: Indicates the same frequency."),
-          p("PRR < 1: Indicates a lower frequency of the ADR for the drug.")
-          
+          div(plotOutput("plot_histogram"), style="margin-bottom:100px;")
         )
       ),
       
-      layout_sidebar(fluid = TRUE, position = "left", tags$style(HTML("
-        .control-label { white-space: normal; }  /* Ensure labels wrap properly */
-        .sidebar { padding: 10px; margin: 0; }  /* Adjust sidebar padding and margin */
-      ")),
-        sidebar = sidebarPanel(width = 12,
-          checkboxGroupInput(inputId = "Gender_PRR",
-                             label = "Select Gender(s):",
-                             choices = c("Male" = "M", "Female" = "F", "Unknown" = "UNK"),
-                             selected = "M"),
-          
-          checkboxGroupInput(inputId = "Patient_Outcome_PRR",
-                             label = "Select Patient Outcome(s):",
-                             choices = c("Required Intervention" = "RI", 
-                                         "Congenital Anomaly" = "CA", 
-                                         "Disability" = "DS", 
-                                         "Hospitalization" = "HO", 
-                                         "Life Threatening" = "LT", 
-                                         "Death" = "DE"),
-                             selected = "DE"),
-          
-          selectInput("psych_dropdown_PRR",
-                      label = "Select a psychiatric condition to analyze:",
-                      choices = sort(unique(df_reactions$reaction_pt)),
-                      multiple = FALSE,
-                      selected = "anger"),
-          
-          selectInput("Drug_ADR_PRR",
-                      label = "Pick a Drug-ADR to analyze:",
-                      choices = sort(unique(drug_adr_trend_PRR)),
-                      multiple = TRUE,
-                      selected = "")
-        ),
-        mainPanel(
-          div(plotOutput("PRR_plot", width = "1600px", height = "400px"), style = "margin-bottom:100px;"),
-          div(uiOutput("caveatPieTextPRR"), style = "margin-bottom:100px; text-align:center;"),
-          div(DT::dataTableOutput("PRR_table"), style = "margin-bottom:100px; text-align:center;"),
-          div(plotOutput("PRR_lineplot", width = "1600px", height = "400px"), style = "margin-bottom:100px;"),
-          div(uiOutput("caveatTextPRR"), style = "margin-bottom:100px; text-align:center;")
+      card(
+        height = "100%",
+        full_screen = TRUE,
+        layout_sidebar(
+          sidebar = sidebarPanel(
+            width = 12,
+            sliderInput(
+              "slider_age_bracket",
+              label = "Select Age Bracket:",
+              min = 0,
+              max = 110,
+              step = 1,
+              value = c(0, 110)
+            )
+          ),
+          div(plotOutput("plot_drug_age_bracket"), style="margin-bottom:100px;")
+        )
+      ),
+      
+      card(
+        height = "100%",
+        full_screen = TRUE,
+        layout_sidebar(
+          sidebar = sidebarPanel(
+            width = 12,
+            sliderInput(
+              "year",
+              label = "Select Interval:",
+              min = min(as.numeric(df$years)),
+              max = max(as.numeric(df$years)),
+              step = 1,
+              value = c(min(as.numeric(df$years)), max(as.numeric(df$years))),
+              sep = ""
+            )
+          ),
+          div(plotOutput("plot_total_cases"), style="margin-bottom:100px;")
+        )
+      ),
+      
+      card(
+        height = "100%",
+        full_screen = TRUE,
+        layout_sidebar(
+          sidebar = sidebarPanel(
+            width = 12,
+            sliderInput(
+              "lag_bins",
+              label = "Select Number of bins for lag histogram:",
+              min = 1,
+              max = 100,
+              step = 1,
+              value = 50
+            ),
+            selectInput(
+              "selected_drug",
+              label = "Select a Drug:",
+              choices = unique(df$ps_drugname),
+              selected = unique(df$ps_drugname)[1]
+            )
+          ),
+          div(plotOutput("plot_lag_drug"), style="margin-bottom:100px;")
+        )
+      ),
+      
+      card(
+        height = "100%",
+        full_screen = TRUE,
+        layout_sidebar(
+          sidebar = sidebarPanel(
+            width = 12,
+            selectInput("dataframe_columns", 
+                        label = "Select 2 columns to analyze:", 
+                        choices = colnames(df_outc_cod_limit_null), 
+                        multiple = TRUE
+            ),
+            conditionalPanel(
+              condition = "input.has_choices == TRUE", 
+              selectInput("length_greater_15",
+                          label = "Select as many options as you would like to compare (wouldn't recommend too many!)", 
+                          choices = "", 
+                          multiple = TRUE
+              )
+            ),
+            selectInput(
+              "unique_values", 
+              label = "Select 1 unique variable corresponding to your 1st input in the menu above",
+              choices = "",
+              multiple = TRUE
+            )
+          ),
+          plotOutput("plot_patient_outcome")
         )
       )
+    ),
+  
+    navbarMenu(
+      title = "Statistical Tests and Analyses", icon = icon("chart-column"),
+      # ROR Analysis
+      nav_panel(
+        title = "ROR Analysis", 
+        icon = icon("pills"),     
+          div(style = "text-align:center;", 
+              h2("Reporting Odds Ratio (ROR)"),
+              p("The Reporting Odds Ratio (ROR) is calculated as:"),
+              tags$div(style = "text-align: center;",
+                       withMathJax("$$ROR = \\frac{a / b}{c / d} = \\frac{a \\cdot d}{b \\cdot c}$$")
+              ),
+              p("Where:"),
+              p("a: Number of cases where the drug is reported with the specific ADR."),
+              p("b: Number of cases where the drug is reported without the specific ADR."),
+              p("c: Number of cases where other drugs are reported with the specific ADR."),
+              p("d: Number of cases where other drugs are reported without the specific ADR."),
+              h3("Interpretation"),
+              p("ROR > 1: Suggests a positive association between the drug and the ADR."),
+              p("ROR = 1: No association."),
+              p("ROR < 1: Suggests a negative association.")
+              
+          ), 
+        layout_sidebar(
+             fillable = TRUE,
+             sidebar = sidebarPanel(width = 10,
+                                    checkboxGroupInput(inputId = "Gender_ROR",
+                                                       label = "Select Gender(s):",
+                                                       choices = c("Male" = "M", "Female" = "F", "Unknown" = "UNK"),
+                                                       selected = "M"),
+                                    
+                                    checkboxGroupInput(inputId = "Patient_Outcome_ROR",
+                                                       label = "Select Patient Outcome(s):",
+                                                       choices = c("Required Intervention" = "RI", 
+                                                                   "Congenital Anomaly" = "CA", 
+                                                                   "Disability" = "DS", 
+                                                                   "Hospitalization" = "HO", 
+                                                                   "Life Threatening" = "LT", 
+                                                                   "Death" = "DE"),
+                                                       selected = c("DE", "LT", "DS", "CA")),
+                                    
+                                    selectInput("psych_dropdown_ROR",
+                                                label = "Select a psychiatric condition to analyze:",
+                                                choices = sort(unique(df_reactions$reaction_pt)),
+                                                multiple = FALSE,
+                                                selected = "completed suicide"),
+                                    
+                                    actionButton(inputId = "submit_ROR", label = "Compute ROR"),
+                                    
+                                    selectInput("Drug_ADR_ROR",
+                                                label = "Pick a Drug-ADR to analyze:",
+                                                choices = "",
+                                                multiple = TRUE,
+                                                selected = "")
+             ),
+             div(
+               plotOutput("ROR_plot"),
+               style = "margin-bottom: 30px;" # Add space after the plot
+             ),
+             div(
+               DT::dataTableOutput("ROR_table"),
+               style = "margin-bottom: 30px;" # Add space after the table
+             ),
+             div(
+               plotOutput("ROR_lineplot"),
+               style = "margin-bottom: 30px;" # Add space after the second plot
+             )
+          ),
+        card_footer("Caveat: Some drugs may not show up in the pie chart if their value is 0."),
+        card_footer("Caveat: These renderings are based on a sample dataset and may not represent real-world data accurately.")
+      ),
+    
+      # PRR Analysis
+      nav_panel(
+        title = "PRR Analysis",
+        icon = icon("chart-area"),       
+        div(style="text-align:center;",
+            h2("Proportional Reporting Ratio (PRR)"),
+            p("The Proportional Reporting Ratio (PRR) is calculated as:"),
+            tags$div(style = "text-align: center;",
+                     withMathJax("$$PRR = \\frac{\\text{Proportion of ADR for the drug}}{\\text{Proportion of ADR for all other drugs}}$$"),
+                     withMathJax("$$PRR = \\frac{a / (a + b)}{c / (c + d)}$$")
+            ),
+            p("Where:"),
+            p("a: Number of cases where the drug is reported with the specific ADR."),
+            p("b: Number of cases where the drug is reported without the specific ADR."),
+            p("c: Number of cases where other drugs are reported with the specific ADR."),
+            p("d: Number of cases where other drugs are reported without the specific ADR."),
+            h3("Interpretation"),
+            p("PRR > 1: Indicates a higher frequency of the ADR for the drug."),
+            p("PRR = 1: Indicates the same frequency."),
+            p("PRR < 1: Indicates a lower frequency of the ADR for the drug.")
+            
+        ), 
+        layout_sidebar(
+          fillable = TRUE,
+           sidebar = sidebarPanel(
+             width = 10,
+              checkboxGroupInput(inputId = "Gender_PRR",
+                                 label = "Select Gender(s):",
+                                 choices = c("Male" = "M", "Female" = "F", "Unknown" = "UNK"),
+                                 selected = "M"),
+              
+              checkboxGroupInput(inputId = "Patient_Outcome_PRR",
+                                 label = "Select Patient Outcome(s):",
+                                 choices = c("Required Intervention" = "RI", 
+                                             "Congenital Anomaly" = "CA", 
+                                             "Disability" = "DS", 
+                                             "Hospitalization" = "HO", 
+                                             "Life Threatening" = "LT", 
+                                             "Death" = "DE"),
+                                 selected = "DE"),
+             
+              selectInput("psych_dropdown_PRR",
+                          label = "Select a psychiatric condition to analyze:",
+                          choices = sort(unique(df_reactions$reaction_pt)),
+                          multiple = FALSE,
+                          selected = "completed suicide"),
+             
+             actionButton(inputId = "submit_PRR", label = "Compute PRR"),
+              
+              selectInput("Drug_ADR_PRR",
+                          label = "Pick a Drug-ADR to analyze:",
+                          choices = "",
+                          multiple = TRUE,
+                          selected = "")
+           ),
+          
+          div(
+            plotOutput("PRR_plot"),
+            style = "margin-bottom: 30px;" # Add space after the plot
+          ),
+          div(
+            DT::dataTableOutput("PRR_table"),
+            style = "margin-bottom: 30px;" # Add space after the table
+          ),
+          div(
+            plotOutput("PRR_lineplot"),
+            style = "margin-bottom: 30px;" # Add space after the second plot
+          )
+        
+      ),
+      card_footer("Caveat: Some drugs may not show up in the pie chart if their value is 0."),
+      card_footer("Caveat: These renderings are based on a sample dataset and may not represent real-world data accurately.")
     ),
     
     # BCPNN Analysis
     nav_panel(
       title = "BCPNN Analysis",
       icon = icon("chart-pie"),
-      fluidPage(
-        div(style = "text-align:center;",
+      div(style = "text-align:center;",
           h2("Bayesian Confidence Propagation Neural Network (BCPNN)"),
           p("BCPNN uses Bayesian statistics to calculate the Information Component (IC) as:"),
           tags$div(style = "text-align: center;",
@@ -1071,60 +889,70 @@ ui <- page_navbar(
           p("IC > 0: Indicates a positive association between the drug and the ADR."),
           p("IC = 0: Indicates no association."),
           p("IC < 0: Indicates a negative association.")
+      ), 
+      layout_sidebar(
+        sidebar = sidebarPanel(
+          width = 10,
+         checkboxGroupInput(inputId = "Gender_BCPNN",
+                            label = "Select Gender(s):",
+                            choices = c("Male" = "M", "Female" = "F", "Unknown" = "UNK"),
+                            selected = "M"),
+         
+         checkboxGroupInput(inputId = "Patient_Outcome_BCPNN",
+                            label = "Select Patient Outcome(s):",
+                            choices = c("Required Intervention" = "RI", 
+                                        "Congenital Anomaly" = "CA", 
+                                        "Disability" = "DS", 
+                                        "Hospitalization" = "HO", 
+                                        "Life Threatening" = "LT", 
+                                        "Death" = "DE"),
+                            selected = "DE"),
+         
+         selectInput("psych_dropdown_BCPNN",
+                     label = "Select a psychiatric condition to analyze:",
+                     choices = sort(unique(df_reactions$reaction_pt)),
+                     multiple = FALSE,
+                     selected = "completed suicide"),
+         
+         actionButton(inputId = "submit_BCPNN", label = "Compute BCPNN"),
+         
+         selectInput("Drug_ADR_BCPNN",
+                     label = "Pick a Drug-ADR to analyze:",
+                     choices = "",
+                     multiple = TRUE,
+                     selected = "")
+        ),
+        
+        div(
+          plotOutput("BCPNN_plot"),
+          style = "margin-bottom: 30px;" # Add space after the plot
+        ),
+        div(
+          DT::dataTableOutput("BCPNN_table"),
+          style = "margin-bottom: 30px;" # Add space after the table
+        ),
+        div(
+          plotOutput("BCPNN_lineplot"),
+          style = "margin-bottom: 30px;" # Add space after the second plot
         )
       ),
-      
-      layout_sidebar(
-        sidebar = sidebarPanel(width = 12,
-          checkboxGroupInput(inputId = "Gender_BCPNN",
-                             label = "Select Gender(s):",
-                             choices = c("Male" = "M", "Female" = "F", "Unknown" = "UNK"),
-                             selected = "M"),
-          
-          checkboxGroupInput(inputId = "Patient_Outcome_BCPNN",
-                             label = "Select Patient Outcome(s):",
-                             choices = c("Required Intervention" = "RI", 
-                                         "Congenital Anomaly" = "CA", 
-                                         "Disability" = "DS", 
-                                         "Hospitalization" = "HO", 
-                                         "Life Threatening" = "LT", 
-                                         "Death" = "DE"),
-                             selected = "DE"),
-          
-          selectInput("psych_dropdown_BCPNN",
-                      label = "Select a psychiatric condition to analyze:",
-                      choices = sort(unique(df_reactions$reaction_pt)),
-                      multiple = FALSE,
-                      selected = "completed suicide"),
-          
-          selectInput("Drug_ADR_BCPNN",
-                      label = "Pick a Drug-ADR to analyze:",
-                      choices = sort(unique(drug_adr_trend_BCPNN)),
-                      multiple = TRUE,
-                      selected = "")
-        ),
-        mainPanel(
-          div(plotOutput("BCPNN_plot", width = "1600px", height = "400px"), style = "margin-bottom:100px;"),
-          div(uiOutput("caveatPieTextBCPNN"), style = "margin-bottom:100px; text-align:center;"),
-          div(DT::dataTableOutput("BCPNN_table"), style = "margin-bottom:100px; text-align:center;"),
-          div(plotOutput("BCPNN_lineplot", width = "1600px", height = "400px"), style = "margin-bottom:100px;"),
-          div(uiOutput("caveatTextBCPNN"), style = "margin-bottom:100px; text-align:center;")
-        )
-      )
+      card_footer("Caveat: Some drugs may not show up in the pie chart if their value is 0."),
+      card_footer("Caveat: These renderings are based on a sample dataset and may not represent real-world data accurately.")
     )
   ),
   
   nav_spacer(),
   nav_menu(
-    title = "Links",
+    title = "External Links",
     align = "right",
     nav_item(tags$a("Github", href = "https://github.com/gabriel21-vt")),
     nav_item(tags$a("Linkedin" , href = "https://www.linkedin.com/in/gabriel-dell-2b5841222/")),
     nav_item(tags$a("Pharmocoviligance Summary", href = "https://pubmed.ncbi.nlm.nih.gov/30126707/"))
   )
+  )
 )
 
-# Server
+###############################Server###########################################
 server <- function(input, output, session) {
   
   has_choices <- reactiveVal(FALSE)
@@ -1132,7 +960,7 @@ server <- function(input, output, session) {
   # Render Selected Table
   output$selected_table <- renderDataTable({
     switch(input$table_choice,
-           "Full Dataframe" = df,
+           "Full Dataframe" = df_unedited,
            "Target Drugs" = df_target_drugs,
            "Psychiatric Conditions" = df_psychiatric,
            "Description Table" = description_table)
@@ -1376,13 +1204,13 @@ server <- function(input, output, session) {
   })
   
   
-  #################################################
-  ###########ROR-table-plot########################
-  
+
+####################ROR-table-plot##############################################
   # Create a reactive expression to compute ROR_data
-  ROR_data <- reactive({
+  ROR_data <- eventReactive(input$submit_ROR, {
+    
     # Ensure the required inputs are provided
-    req(input$psych_dropdown_ROR)
+    #req(input$psych_dropdown_ROR)
     req(input$Gender_ROR)
     req(input$Patient_Outcome_ROR)
     
@@ -1396,53 +1224,59 @@ server <- function(input, output, session) {
     progress$set(message = "Computing ROR", value = 0)
     # Close the progress when this reactive exits (even if there's an error)
     on.exit(progress$close())
-    
+
     updateProgress <- function(value = NULL, detail = NULL) {
       if (is.null(value)) {
         value <- progress$getValue()
-        value <- value + (progress$getMax() - value) / 5
+        value <- value + (progress$getMax() - value) / length(unique(filtered_data$reaction_pt))
       }
       progress$set(value = value, detail = detail)
     }
     
     # Compute ROR and PRR tables
-    tables <- Running_ROR(filtered_data, c("ps_drugname", "reaction_pt"), updateProgress)
-    #print(tables[["ROR_table"]])
+    table <- Running_ROR_PRR_BCPNN(filtered_data, c("ps_drugname", "reaction_pt"), type = c("ROR"), updateProgress)
     
+    #Fill NA with 0's
+    table$ROR[is.na(table$ROR)] <- 0
+
+    
+
     # Return the ROR table
-    tables[["ROR_table"]]
+    return(list(ROR = table$ROR))
   })
   
-  # Render the pie chart using ROR_data
+  
+  # Render the bar chart using ROR_data
   output$ROR_plot <- renderPlot({
     req(ROR_data())  # Ensure ROR_data is available
     
     # Generate the pie chart
-    pie_func(t(ROR_data()), input$psych_dropdown_ROR, "ROR")
+    bar_func(t(ROR_data()$ROR), input$psych_dropdown_ROR, "ROR")
   })
   
   # Render the table using the same ROR_data
   output$ROR_table <- DT::renderDataTable({
     req(ROR_data())
-    table_ROR <- ROR_data() 
+    table_ROR <- ROR_data()$ROR
     table_ROR <- format(table_ROR, digits=2)
+    table_ROR <- t(table_ROR)
     table_ROR
   }, options = list(
     paging = TRUE,
-    pageLength = 15,
+    pageLength = 10,
     scrollX = TRUE,
     scrollY = TRUE,
-    autoWidth = TRUE
+    autoWidth = FALSE
   ))
+
   
-  #################################################
   ###########PRR-table-plot########################
   
   # Create a reactive expression to compute ROR_data
-  PRR_data <- reactive({
+  PRR_data <- eventReactive(input$submit_PRR, {
     
     # Ensure the required inputs are provided
-    req(input$psych_dropdown_PRR)
+    #req(input$psych_dropdown_PRR)
     req(input$Gender_PRR)
     req(input$Patient_Outcome_PRR)
     
@@ -1456,50 +1290,54 @@ server <- function(input, output, session) {
     progress$set(message = "Computing PRR", value = 0)
     # Close the progress when this reactive exits (even if there's an error)
     on.exit(progress$close())
-    
+
     updateProgress <- function(value = NULL, detail = NULL) {
       if (is.null(value)) {
         value <- progress$getValue()
-        value <- value + (progress$getMax() - value) / 5
+        value <- value + (progress$getMax() - value) / length(unique(filtered_data$reaction_pt))
       }
       progress$set(value = value, detail = detail)
     }
     
     # Compute ROR and PRR tables
-    tables <- Running_PRR(filtered_data, c("ps_drugname", "reaction_pt"), updateProgress)
+    table <- Running_ROR_PRR_BCPNN(filtered_data, c("ps_drugname", "reaction_pt"), type=c("PRR"), updateProgress)
+    
+    table$PRR[is.na(table$PRR)] <- 0
+
     
     # Return the ROR table
-    tables[["PRR_table"]]
-    
-    
+    return(list(PRR = table$PRR))
   })
   
   output$PRR_plot <- renderPlot({
     req(PRR_data)
     
     #convert data to data frame
-    PRR_data_df <- as.data.frame(PRR_data())
-    pie_func(t(PRR_data_df), input$psych_dropdown_PRR, "PRR")
+    PRR_data_df <- as.data.frame(PRR_data()$PRR)
+    bar_func(t(PRR_data_df), input$psych_dropdown_PRR, "PRR")
   })
   
   output$PRR_table <- DT::renderDataTable({
     req(PRR_data)
-    table_PRR <- PRR_data() 
-    table_PRR <- format(table_ROR, digits=2)
+    table_PRR <- PRR_data()$PRR 
+    table_PRR <- format(table_PRR, digits=2)
+    table_PRR <- t(table_PRR)
     table_PRR
   }, options = list(
     paging = TRUE,
-    pageLength = 15,
+    pageLength = 10,
     scrollX = TRUE,
     scrollY = TRUE,
-    autoWidth = TRUE
+    autoWidth = FALSE
   ))
   
+
+  
   ###########################BCPNN table plots #################################
-  BCPNN_data <- reactive({
+  BCPNN_data <- eventReactive(input$submit_BCPNN, {
     
     # Ensure the required inputs are provided
-    req(input$psych_dropdown_BCPNN)
+    #req(input$psych_dropdown_BCPNN)
     req(input$Gender_BCPNN)
     req(input$Patient_Outcome_BCPNN)
     
@@ -1513,22 +1351,21 @@ server <- function(input, output, session) {
     progress$set(message = "Computing BCPNN", value = 0)
     # Close the progress when this reactive exits (even if there's an error)
     on.exit(progress$close())
-    
+
     updateProgress <- function(value = NULL, detail = NULL) {
       if (is.null(value)) {
         value <- progress$getValue()
-        value <- value + (progress$getMax() - value) / 5
+        value <- value + (progress$getMax() - value) / length(unique(filtered_data$reaction_pt))
       }
       progress$set(value = value, detail = detail)
     }
     
     # Compute ROR and PRR tables
-    tables <- Running_BCPNN(filtered_data, c("ps_drugname", "reaction_pt"), updateProgress)
+    table <- Running_ROR_PRR_BCPNN(filtered_data, c("ps_drugname", "reaction_pt"), type=c("BCPNN"), updateProgress)
     
+    table$BCPNN[is.na(table$BCPNN)] <- 0
     # Return the ROR table
-    tables[["BCPNN_table"]]
-    
-    
+    return(list(BCPNN = table$BCPNN))
   })
   
   output$BCPNN_plot <- renderPlot({
@@ -1536,86 +1373,258 @@ server <- function(input, output, session) {
     
     #convert data to data frame
     BCPNN_data_df <- as.data.frame(BCPNN_data())
-    pie_func(t(BCPNN_data_df), input$psych_dropdown_BCPNN, "BCPNN")
+    bar_func(t(BCPNN_data_df), input$psych_dropdown_BCPNN, "BCPNN")
   })
   
   output$BCPNN_table <- DT::renderDataTable({
     req(BCPNN_data)
-    table_BCPNN <- BCPNN_data() 
+    table_BCPNN <- BCPNN_data()$BCPNN
     table_BCPNN <- format(table_BCPNN, digits=2)
+    table_BCPNN <- t(table_BCPNN)
     table_BCPNN
   }, options = list(
     paging = TRUE,
-    pageLength = 15,
+    pageLength = 10,
     scrollX = TRUE,
     scrollY = TRUE,
-    autoWidth = TRUE
+    autoWidth = FALSE
   ))
-  
 
+  
+  ROR_lineplot_data <- reactiveVal(NULL)
+  PRR_lineplot_data <- reactiveVal(NULL)
+  BCPNN_lineplot_data <- reactiveVal(NULL)
+  
+  #Create an observe method that runs the ror, prr and bcpnn plot for trend tests
+  #Should move the computations to the server side, meaning the overall elapsed time to load the program should decrease significantly, like 95%.
+  #Should only run once, to update the select input(s) for ROR, PRR and BCPNN tabs
+  #Should have a progress bar for this one, may be a while to do (like 40-50 seconds)
+  observe({
+    columns <- c("ps_drugname", "reaction_pt")
+    df_reaction_pair_year <- df_reactions %>%
+      group_by(across(all_of(columns)), years) %>%  # Group by the columns in the list and 'year'
+      summarise(Count = n(), .groups = 'drop')
+
+
+    #in df_reaction_no_singulair, combine ps_drugname and reaction_pt to create a new column
+    df_reaction_pair_year$Drug_ADR <- paste(df_reaction_pair_year$ps_drugname,df_reaction_pair_year$reaction_pt, sep = "-")
+
+    dimensions <- dim(df_reaction_pair_year)
+
+
+    #############################ROR############################################
+    compute_ror <- function(df, year) {
+      # Filter for the specific year
+      df_year <- df %>% filter(years == year)
+      
+      # Compute a, b, c, d
+      a_b_c_d <- df_year %>%
+        group_by(ps_drugname, reaction_pt) %>%
+        summarise(
+          a = sum(Count), # Cases for the specific Drug-ADR pair
+          b = sum(df_year$Count[df_year$ps_drugname == first(ps_drugname)]) - a, # Same drug, other ADRs
+          c = sum(df_year$Count[df_year$reaction_pt == first(reaction_pt)]) - a, # Other drugs, same ADR
+          d = sum(df_year$Count) - (a + b + c), # Other drugs, other ADRs
+          .groups = "drop"
+        ) 
+      
+      # Compute ROR with confidence intervals
+      a_b_c_d <- a_b_c_d %>%
+        mutate(
+          ROR = ROR(a,b,c,d),
+          lower_CI = exp(log(ROR) - 1.96 * sqrt(1/a + 1/b + 1/c + 1/d)),
+          upper_CI = exp(log(ROR) + 1.96 * sqrt(1/a + 1/b + 1/c + 1/d)),
+          years = year # Ensure 'years' is included as a column
+        ) %>% mutate(
+          ROR = ifelse(is.infinite(ROR) | is.nan(ROR), 0, ROR),
+          lower_CI = ifelse(is.infinite(lower_CI) | is.nan(lower_CI), 0, lower_CI),
+          upper_CI = ifelse(is.infinite(upper_CI) | is.nan(upper_CI), 0, upper_CI)
+        ) %>%
+        select(years, ps_drugname, reaction_pt, ROR, lower_CI, upper_CI)
+      
+      return(a_b_c_d)
+    }
+    
+    # Apply function for each unique year
+    df_ror <- df_reaction_pair_year %>%
+      distinct(years) %>%
+      pull(years) %>%
+      lapply(function(y) compute_ror(df_reaction_pair_year, y)) %>%
+      bind_rows()
+    
+    df_ror$Drug_ADR <- paste(df_ror$ps_drugname,df_ror$reaction_pt, sep = "-")
+
+
+    #ROR drug adr trend analysis
+    trend_test_ROR <- mann_kendall_test(df_ror, "ROR")
+    #print(trend_test_ROR)
+    
+    # Filter to only include statistically significant (P < 0.05) and positive trends (Score > 0)
+    trend_test_ROR <- trend_test_ROR %>%
+      filter(Score > 0) %>%
+      arrange(P_Value)  # Arrange by significance level
+    
+    # Extract top trending Drug-ADR pairs
+    drug_adr_trend_ROR <- trend_test_ROR$Drug_ADR
+    
+
+    ###############################PRR##########################################
+    
+    compute_prr <- function(df, year) {
+      # Filter for the specific year
+      df_year <- df %>% filter(years == year)
+      
+      # Compute a, b, c, d
+      a_b_c_d <- df_year %>%
+        group_by(ps_drugname, reaction_pt) %>%
+        summarise(
+          a = sum(Count), # Cases for the specific Drug-ADR pair
+          b = sum(df_year$Count[df_year$ps_drugname == first(ps_drugname)]) - a, # Same drug, other ADRs
+          c = sum(df_year$Count[df_year$reaction_pt == first(reaction_pt)]) - a, # Other drugs, same ADR
+          d = sum(df_year$Count) - (a + b + c), # Other drugs, other ADRs
+          .groups = "drop"
+        ) 
+      
+      # Compute ROR with confidence intervals
+      a_b_c_d <- a_b_c_d %>%
+        mutate(
+          #PRR = (a / (a+b)) / (c / (c+d)),
+          PRR = PRR(a,b,c,d),
+          lower_CI = exp(log(PRR) - 1.96 * sqrt(1/a + 1/b + 1/c + 1/d)),
+          upper_CI = exp(log(PRR) + 1.96 * sqrt(1/a + 1/b + 1/c + 1/d)),
+          years = year # Ensure 'years' is included as a column
+        ) %>% mutate(
+          PRR = ifelse(is.infinite(PRR) | is.nan(PRR), 0, PRR),
+          lower_CI = ifelse(is.infinite(lower_CI) | is.nan(lower_CI), 0, lower_CI),
+          upper_CI = ifelse(is.infinite(upper_CI) | is.nan(upper_CI), 0, upper_CI)
+        ) %>%
+        select(years, ps_drugname, reaction_pt, PRR, lower_CI, upper_CI)
+      
+      return(a_b_c_d)
+    }
+    
+    # Apply function for each unique year
+    df_prr <- df_reaction_pair_year %>%
+      distinct(years) %>%
+      pull(years) %>%
+      lapply(function(y) compute_prr(df_reaction_pair_year, y)) %>%
+      bind_rows()
+    
+    df_prr$Drug_ADR <- paste(df_prr$ps_drugname,df_prr$reaction_pt, sep = "-")
+
+    #PRR drug-adr trend analysis
+    trend_test_PRR <- mann_kendall_test(df_prr, "PRR")
+    
+    # Filter to only include statistically significant (P < 0.05) and positive trends (Score > 0)
+    trend_test_PRR <- trend_test_PRR %>%
+      filter(Score > 0) %>%
+      arrange(P_Value)  # Arrange by significance level
+    
+    drug_adr_trend_PRR <- trend_test_PRR$Drug_ADR
+    
+    
+    ############################################################################
+    ##############################BCPNN#########################################
+    
+    compute_bcpnn <- function(df, year) {
+      # Filter for the specific year
+      df_year <- df %>% filter(years == year)
+
+      # Compute a, b, c, d
+      a_b_c_d <- df_year %>%
+        group_by(ps_drugname, reaction_pt) %>%
+        summarise(
+          a = sum(Count), # Cases for the specific Drug-ADR pair
+          b = sum(df_year$Count[df_year$ps_drugname == first(ps_drugname)]) - a, # Same drug, other ADRs
+          c = sum(df_year$Count[df_year$reaction_pt == first(reaction_pt)]) - a, # Other drugs, same ADR
+          d = sum(df_year$Count) - (a + b + c), # Other drugs, other ADRs
+          .groups = "drop"
+        )
+
+      # Compute ROR with confidence intervals
+      a_b_c_d <- a_b_c_d %>%
+        mutate(
+          BCPNN = BCPNN(a, b, c, d),
+          lower_CI = exp(log(BCPNN) - 1.96 * sqrt(1/a + 1/b + 1/c + 1/d)),
+          upper_CI = exp(log(BCPNN) + 1.96 * sqrt(1/a + 1/b + 1/c + 1/d)),
+          years = year # Ensure 'years' is included as a column
+        ) %>% mutate(
+          BCPNN = ifelse(is.infinite(BCPNN) | is.nan(BCPNN), 0, BCPNN),
+          lower_CI = ifelse(is.infinite(lower_CI) | is.nan(lower_CI), 0, lower_CI),
+          upper_CI = ifelse(is.infinite(upper_CI) | is.nan(upper_CI), 0, upper_CI)
+        ) %>%
+        select(years, ps_drugname, reaction_pt, BCPNN, lower_CI, upper_CI)
+
+      return(a_b_c_d)
+    }
+
+    # Apply function for each unique year
+    df_bcpnn <- df_reaction_pair_year %>%
+      distinct(years) %>%
+      pull(years) %>%
+      lapply(function(y) compute_bcpnn(df_reaction_pair_year, y)) %>%
+      bind_rows()
+
+    df_bcpnn$Drug_ADR <- paste(df_bcpnn$ps_drugname,df_bcpnn$reaction_pt, sep = "-")
+
+    #BCPNN drug-adr trend analysis
+    trend_test_BCPNN <- mann_kendall_test(df_bcpnn, "BCPNN")
+    
+    # Filter to only include statistically significant (P < 0.05) and positive trends (Score > 0)
+    trend_test_BCPNN <- trend_test_BCPNN %>%
+      filter(Score > 0) %>%
+      arrange(P_Value)  # Arrange by significance level
+    
+    drug_adr_trend_BCPNN <- trend_test_BCPNN$Drug_ADR
+    
+    ########################lineplot data storage###############################
+    ROR_lineplot_data(df_ror)
+    PRR_lineplot_data(df_prr)
+    BCPNN_lineplot_data(df_bcpnn)
+
+    updateSelectInput(
+      session,
+      "Drug_ADR_ROR",
+      choices = sort(unique(drug_adr_trend_ROR)),
+      selected = NULL
+    )
+
+    updateSelectInput(
+      session,
+      "Drug_ADR_PRR",
+      choices = sort(unique(drug_adr_trend_PRR)),
+      selected = NULL
+    )
+
+    updateSelectInput(
+      session,
+      "Drug_ADR_BCPNN",
+      choices = sort(unique(drug_adr_trend_BCPNN)),
+      selected = NULL
+    )
+
+  })
+  
+  
   
   #--------------ROR lineplot function and Mann Kendall Test-------------------#
   output$ROR_lineplot <- renderPlot({
-    req(input$Drug_ADR_ROR)
-    lineplot_func(ROR_pair_years,  input$Drug_ADR_ROR, "ROR")
+    req(input$Drug_ADR_ROR, ROR_lineplot_data())
+    lineplot_func(ROR_lineplot_data(),  input$Drug_ADR_ROR, "ROR")
   })
   
   #--------------PRR lineplot function and Mann Kendall Test-------------------#
   output$PRR_lineplot <- renderPlot({
-    req(input$Drug_ADR_PRR)
-    lineplot_func(PRR_pair_years, input$Drug_ADR_PRR, "PRR")
+    req(input$Drug_ADR_PRR, PRR_lineplot_data())
+    lineplot_func(PRR_lineplot_data(), input$Drug_ADR_PRR, "PRR")
   })
   
   #--------------BCPNN lineplot function and Mann Kendall Test-------------------#
   output$BCPNN_lineplot <- renderPlot({
-    req(input$Drug_ADR_BCPNN)
-    lineplot_func(BCPNN_pair_years, input$Drug_ADR_BCPNN, "BCPNN")
+    req(input$Drug_ADR_BCPNN, BCPNN_lineplot_data())
+    lineplot_func(BCPNN_lineplot_data(), input$Drug_ADR_BCPNN, "BCPNN")
   })
-
-  #---------------------------Caveat for Pie Chart------------------------------#
-  output$caveatPieTextROR <- renderUI({
-    tags$div(
-      "Caveat: Some drugs may not show up in the pie chart if their value is 0.",
-      style = "text-align: center;"
-    )
-  })
-  output$caveatPieTextPRR <- renderUI({
-    tags$div(
-      "Caveat: Some drugs may not show up in the pie chart if their value is 0.",
-      style = "text-align: center;"
-    )
-  })
-  output$caveatPieTextBCPNN <- renderUI({
-    tags$div(
-      "Caveat: Some drugs may not show up in the pie chart if their value is 0.",
-      style = "text-align: center;"
-    )
-  })
-  
-  #-------------------------Caveat for beneath Lineplot------------------------#
-  
-  output$caveatTextROR <- renderUI({
-    tags$div(
-      "Caveat: These renderings are based on a sample dataset and may not represent real-world data accurately.",
-      style = "text-align: center;"
-    )
-  })
-  
-  output$caveatTextPRR <- renderUI({
-    tags$div(
-      "Caveat: These renderings are based on a sample dataset and may not represent real-world data accurately.",
-      style = "text-align: center;"
-    )
-  })
-  
-  output$caveatTextBCPNN <- renderUI({
-    tags$div(
-      "Caveat: These renderings are based on a sample dataset and may not represent real-world data accurately.",
-      style = "text-align: center;"
-    )
-  })
-  
   
 }
 
-shinyApp(ui = ui, server = server, options = list(height = 1300))
+shinyApp(ui = ui, server = server)
